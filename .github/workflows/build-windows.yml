@@ -232,6 +232,14 @@ jobs:
           git -C TBuild/tdesktop/Telegram apply -p0 "$RUNNER_TEMP/app-glass.patch"
           git -C TBuild/tdesktop/Telegram/lib_ui apply "$RUNNER_TEMP/lib_ui-glass.patch"
 
+      - name: Fix msys2 package name
+        shell: bash
+        run: |
+          # mingw-w64-x86_64-diffutils was removed from msys2 repos.
+          # The msys 'diffutils' package provides the same tools.
+          sed -i 's/mingw-w64-x86_64-diffutils/diffutils/' TBuild/tdesktop/Telegram/build/prepare/prepare.py
+          grep -n 'diffutils' TBuild/tdesktop/Telegram/build/prepare/prepare.py
+
       - name: Prepare libraries (Qt 6)
         shell: cmd
         working-directory: TBuild\tdesktop
