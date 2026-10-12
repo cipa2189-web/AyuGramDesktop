@@ -1,0 +1,269 @@
+name: Build AyuGram Glass (Windows)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Windows x64 Release
+    runs-on: windows-2022
+    timeout-minutes: 340
+
+    steps:
+      - name: Get source
+        uses: actions/checkout@v4
+        with:
+          path: TBuild/tdesktop
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Free up disk space
+        shell: cmd
+        run: |
+          if exist "C:\Android" rmdir /s /q "C:\Android"
+          if exist "C:\Program Files\dotnet" rmdir /s /q "C:\Program Files\dotnet"
+
+      - name: Create build folders
+        shell: bash
+        run: |
+          mkdir -p TBuild/ThirdParty TBuild/Libraries
+
+      - name: Write glass patches
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/app-glass.patch" <<'PATCH_EOF'
+          --- SourceFiles/window/main_window.cpp	2026-10-05 05:21:15.000000000 +0000
+          +++ SourceFiles/window/main_window.cpp	2026-10-12 13:01:26.647603053 +0000
+          @@ -10,6 +10,7 @@
+           #include "api/api_updates.h"
+           #include "storage/localstorage.h"
+           #include "platform/platform_specific.h"
+          +#include "base/platform/base_platform_info.h"
+           #include "ui/platform/ui_platform_window.h"
+           #include "ui/platform/ui_platform_window_title.h"
+           #include "platform/platform_window_title.h"
+          @@ -69,6 +70,16 @@
+           
+           constexpr auto kSaveWindowPositionTimeout = crl::time(1000);
+           
+          +// Glass (translucent) main window is available on Windows 11 with the
+          +// system Acrylic backdrop. Other platforms keep the opaque window.
+          +[[nodiscard]] bool GlassWindowSupported() {
+          +#ifdef Q_OS_WIN
+          +	return ::Platform::IsWindows11OrGreater();
+          +#else
+          +	return false;
+          +#endif
+          +}
+          +
+           using Core::WindowPosition;
+           
+           [[nodiscard]] QRect ScreenAvailableGeometry(not_null<const QWidget*> widget) {
+          @@ -401,7 +412,8 @@
+           }
+           
+           MainWindow::MainWindow(not_null<Controller*> controller)
+          -: _controller(controller)
+          +: Ui::RpWindow(GlassWindowSupported())
+          +, _controller(controller)
+           , _positionUpdatedTimer([=] { savePosition(); })
+           , _outdated(Ui::CreateOutdatedBar(body(), cWorkingDir()))
+           , _screenReaderBar(Ui::CreateScreenReaderBar(body(), [=] {
+          --- SourceFiles/window/themes/window_theme.cpp	2026-10-05 05:21:15.000000000 +0000
+          +++ SourceFiles/window/themes/window_theme.cpp	2026-10-12 13:01:54.803603053 +0000
+          @@ -1294,7 +1294,35 @@
+           	return path.isEmpty() || path.startsWith(u":/gui/"_q);
+           }
+           
+          +// "Glass" overlay for Windows 11: panels become translucent so the system
+          +// Acrylic backdrop shows through. Runs after every palette load/apply/reset,
+          +// so it also survives theme changes.
+          +void ApplyGlassOverlay() {
+          +#ifdef Q_OS_WIN
+          +	if (!::Platform::IsWindows11OrGreater()) {
+          +		return;
+          +	}
+          +	const auto set = [](const char *name, uchar r, uchar g, uchar b, uchar a) {
+          +		style::main_palette::setColor(QLatin1String(name), r, g, b, a);
+          +	};
+          +	// Window and large surfaces: mostly transparent, backdrop does the work.
+          +	set("windowBg", 0x0e, 0x12, 0x20, 0xb8);
+          +	set("titleBg", 0x15, 0x1b, 0x2d, 0xa6);
+          +	set("titleBgActive", 0x1a, 0x21, 0x35, 0xa6);
+          +	set("dialogsBg", 0x14, 0x1a, 0x2d, 0xa6);
+          +	set("dialogsBgOver", 0x1c, 0x24, 0x40, 0x99);
+          +	set("topBarBg", 0x1a, 0x21, 0x35, 0xa6);
+          +	set("historyComposeAreaBg", 0x1a, 0x21, 0x35, 0xa6);
+          +	set("historyToDownBg", 0x25, 0x2e, 0x48, 0xcc);
+          +	// Popups and boxes: more opaque, so text stays readable.
+          +	set("menuBg", 0x1a, 0x20, 0x33, 0xd0);
+          +	set("boxBg", 0x1a, 0x20, 0x33, 0xd0);
+          +	set("tooltipBg", 0x1a, 0x21, 0x35, 0xe0);
+          +#endif
+          +}
+          +
+           bool Initialize(Saved &&saved) {
+          +	style::main_palette::setPostProcess(&ApplyGlassOverlay);
+           	if (InitializeFromSaved(std::move(saved))) {
+           		Background()->setThemeObject(saved.object);
+           		return true;
+          PATCH_EOF
+          cat > "$RUNNER_TEMP/lib_ui-glass.patch" <<'PATCH_EOF'
+          diff --git a/ui/platform/win/ui_window_win.cpp b/ui/platform/win/ui_window_win.cpp
+          index f34c1df..4411ce9 100644
+          --- a/ui/platform/win/ui_window_win.cpp
+          +++ b/ui/platform/win/ui_window_win.cpp
+          @@ -354,11 +354,38 @@ void WindowHelper::overrideSystemButtonDown(HitTestResult button) {
+           	_systemButtonDown.fire_copy(button);
+           }
+           
+          +namespace {
+          +
+          +// Windows 11 system backdrop (Acrylic) for translucent ("glass") windows.
+          +// Needs the frame extended into the client area, so the backdrop shows
+          +// through every surface that is painted with a semi-transparent colour.
+          +void ApplyGlassBackdrop(HWND handle, bool translucent) {
+          +	if (!handle || !translucent || !::Platform::IsWindows11OrGreater()) {
+          +		return;
+          +	}
+          +	const auto margins = MARGINS{ -1, -1, -1, -1 };
+          +	DwmExtendFrameIntoClientArea(handle, &margins);
+          +
+          +	constexpr auto kDWMWA_SYSTEMBACKDROP_TYPE = DWORD(38);
+          +	constexpr auto kDWMSBT_TRANSIENTWINDOW = DWORD(3); // Acrylic.
+          +	const auto backdrop = kDWMSBT_TRANSIENTWINDOW;
+          +	DwmSetWindowAttribute(
+          +		handle,
+          +		kDWMWA_SYSTEMBACKDROP_TYPE,
+          +		&backdrop,
+          +		sizeof(backdrop));
+          +}
+          +
+          +} // namespace
+          +
+           void WindowHelper::init() {
+           	_title->show();
+           
+           	window()->winIdValue() | rpl::on_next([=](WId winId) {
+           		_handle = reinterpret_cast<HWND>(winId);
+          +		ApplyGlassBackdrop(
+          +			_handle,
+          +			window()->testAttribute(Qt::WA_TranslucentBackground));
+           
+           		if (!::Platform::IsWindows8OrGreater()) {
+           			const auto native = _title->isHidden();
+          diff --git a/ui/style/style_core_palette.cpp b/ui/style/style_core_palette.cpp
+          index bad3e65..1846e02 100644
+          --- a/ui/style/style_core_palette.cpp
+          +++ b/ui/style/style_core_palette.cpp
+          @@ -218,14 +218,27 @@ palette &GetMutable() {
+           	return const_cast<palette&>(*get());
+           }
+           
+          +void (*PostProcess)() = nullptr;
+          +
+          +void RunPostProcess() {
+          +	if (PostProcess) {
+          +		PostProcess();
+          +	}
+          +}
+          +
+           } // namespace
+           
+          +void setPostProcess(void (*process)()) {
+          +	PostProcess = process;
+          +}
+          +
+           QByteArray save() {
+           	return GetMutable().save();
+           }
+           
+           bool load(const QByteArray &cache) {
+           	if (GetMutable().load(cache)) {
+          +		RunPostProcess();
+           		style::internal::ResetIcons();
+           		return true;
+           	}
+          @@ -242,16 +255,19 @@ palette::SetResult setColor(QLatin1String name, QLatin1String from) {
+           
+           void apply(const palette &other) {
+           	GetMutable() = other;
+          +	RunPostProcess();
+           	style::internal::ResetIcons();
+           }
+           
+           void reset() {
+           	GetMutable().reset();
+          +	RunPostProcess();
+           	style::internal::ResetIcons();
+           }
+           
+           void reset(const colorizer &with) {
+           	GetMutable().reset(with);
+          +	RunPostProcess();
+           	style::internal::ResetIcons();
+           }
+           
+          diff --git a/ui/style/style_core_palette.h b/ui/style/style_core_palette.h
+          index 13770a7..d62b147 100644
+          --- a/ui/style/style_core_palette.h
+          +++ b/ui/style/style_core_palette.h
+          @@ -71,5 +71,10 @@ void reset();
+           void reset(const colorizer &with);
+           int indexOfColor(color c);
+           
+          +// Called after every load/apply/reset of the main palette, so the app can
+          +// layer extra overrides (e.g. translucent "glass" surfaces) on top of a theme.
+          +// Passing nullptr removes the hook. The hook may call setColor() on main_palette.
+          +void setPostProcess(void (*process)());
+          +
+           } // namespace main_palette
+           } // namespace style
+          PATCH_EOF
+
+      - name: Apply glass patches
+        shell: bash
+        run: |
+          git -C TBuild/tdesktop/Telegram apply -p0 "$RUNNER_TEMP/app-glass.patch"
+          git -C TBuild/tdesktop/Telegram/lib_ui apply "$RUNNER_TEMP/lib_ui-glass.patch"
+
+      - name: Prepare libraries (Qt 6)
+        shell: cmd
+        working-directory: TBuild\tdesktop
+        env:
+          Platform: x64
+        run: |
+          Telegram\build\prepare\win.bat qt6
+
+      - name: Configure
+        shell: cmd
+        working-directory: TBuild\tdesktop\Telegram
+        env:
+          Platform: x64
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          configure.bat x64 qt6 -D TDESKTOP_API_ID=2040 -D TDESKTOP_API_HASH=b18441a1ff607e10a989891a5462e627
+
+      - name: Build
+        shell: cmd
+        working-directory: TBuild\tdesktop
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          cmake --build out --config Release --target Telegram
+
+      - name: Find the exe
+        shell: bash
+        run: |
+          find TBuild/tdesktop/out -name "*.exe" -maxdepth 3 || true
+
+      - name: Upload exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: AyuGram-glass-exe
+          path: TBuild/tdesktop/out/Release/*.exe
+          if-no-files-found: error
